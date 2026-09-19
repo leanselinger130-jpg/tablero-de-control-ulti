@@ -200,7 +200,12 @@ async function parseFile(file) {
    STORAGE LAYER
 --------------------------------------------------------------- */
 async function loadRoundsMeta() {
-  try { const res = await storage.get("rounds-meta"); return res ? JSON.parse(res.value) : []; } catch { return []; }
+  // Se ordena al leer: así toda la app recibe las rondas en orden, sin importar cómo quedaron guardadas.
+  try {
+    const res = await storage.get("rounds-meta");
+    const meta = res ? JSON.parse(res.value) : [];
+    return Array.isArray(meta) ? meta.slice().sort((a, b) => (a.roundNumber ?? 0) - (b.roundNumber ?? 0)) : [];
+  } catch { return []; }
 }
 async function saveRoundsMeta(meta) { await storage.set("rounds-meta", JSON.stringify(meta)); }
 async function loadRoundData(id) {
@@ -473,6 +478,34 @@ const KPI_DEFS = [
   { key: "share", label: "Total", blockTitle: "Informe de mercado, global" },
   { key: "marketcap", label: "Capitalización de mercado, miles USD", blockTitle: "Valuación - Global" },
 ];
+/* Rondas Cesim utilizables, SIEMPRE ordenadas por número de ronda. Nunca confiar en el orden
+   en que quedaron guardadas: al agregar una ronda intermedia o reordenarse el storage, "la última"
+   dejaría de ser la última. Toda la app entra por acá. */
+function sortedCesimRounds(rounds, dataById) {
+  return (rounds || [])
+    .filter((r) => r.kind === "cesim" && dataById[r.id])
+    .sort((a, b) => (a.roundNumber ?? 0) - (b.roundNumber ?? 0));
+}
+// El orden de las columnas de equipos puede cambiar entre rondas (y de hecho cambia la cantidad),
+// así que el índice se resuelve SIEMPRE contra la ronda que se está leyendo, nunca reutilizado.
+function teamIndexIn(roundData, team) {
+  return roundData && team ? roundData.teams.indexOf(team) : -1;
+}
+// Serie ronda a ronda de una métrica, resolviendo el equipo en cada ronda. `fallbackIdx` cubre
+// los widgets que todavía reciben sólo el índice y no el nombre del equipo.
+function seriesByRound(cesimRounds, dataById, ourTeam, getValue, fallbackIdx = -1) {
+  const points = [];
+  cesimRounds.forEach((r) => {
+    const rd = dataById[r.id];
+    if (!rd) return;
+    const idx = ourTeam ? teamIndexIn(rd, ourTeam) : fallbackIdx;
+    if (idx < 0) return;
+    const value = getValue(rd, idx);
+    if (value !== null && value !== undefined) points.push({ roundNumber: r.roundNumber, value });
+  });
+  return points;
+}
+
 function findMetricRow(block, label) {
   if (!block) return null;
   return block.rows.find((r) => r.kind === "metric" && r.label === label) || null;
@@ -601,7 +634,7 @@ function computeDistances(roundData, ourIdx) {
    METRIC CATALOG
 --------------------------------------------------------------- */
 function buildMetricCatalog(rounds, dataById) {
-  const cesimRounds = rounds.filter((r) => r.kind === "cesim" && dataById[r.id]);
+  const cesimRounds = sortedCesimRounds(rounds, dataById);
   if (!cesimRounds.length) return [];
   const ref = dataById[cesimRounds[cesimRounds.length - 1].id];
   const catalog = [];
@@ -825,10 +858,10 @@ function computeStrategyAlignment(plan, roundData, teamIdx) {
    GENERAL SECTION
 ================================================================= */
 function GeneralSection({ rounds, dataById, ourTeam, regionFilter = "Global" }) {
-  const cesimRounds = rounds.filter((r) => r.kind === "cesim" && dataById[r.id]);
-  const teamIdx = ourTeam && cesimRounds.length ? cesimRounds[0].teams.indexOf(ourTeam) : -1;
+  const cesimRounds = sortedCesimRounds(rounds, dataById);
   const latestRound = cesimRounds[cesimRounds.length - 1];
   const latestData = latestRound ? dataById[latestRound.id] : null;
+  const teamIdx = teamIndexIn(latestData, ourTeam);
   const prevRound = cesimRounds[cesimRounds.length - 2];
   const kpiDefs = useMemo(() => KPI_DEFS.map((d) => (d.key === "share" ? { ...d, blockTitle: regionMarketBlockTitle(regionFilter) } : d)), [regionFilter]);
   const prevData = prevRound ? dataById[prevRound.id] : null;
@@ -837,8 +870,7 @@ function GeneralSection({ rounds, dataById, ourTeam, regionFilter = "Global" }) 
     if (teamIdx < 0) return {};
     const series = {};
     kpiDefs.forEach((def) => {
-      const points = [];
-      cesimRounds.forEach((r) => { const v = extractKpi(dataById[r.id], teamIdx, def); if (v !== null) points.push({ roundNumber: r.roundNumber, value: v }); });
+      const points = seriesByRound(cesimRounds, dataById, ourTeam, (rd, i) => extractKpi(rd, i, def), teamIdx);
       if (points.length) series[def.key] = { header: def.label, points };
     });
     return series;
@@ -881,8 +913,8 @@ function GeneralSection({ rounds, dataById, ourTeam, regionFilter = "Global" }) 
       )}
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12 }}>
-        <StatCard label="Rondas cargadas" value={rounds.length} />
-        <StatCard label="Última ronda" value={`R${rounds[rounds.length - 1].roundNumber}`} />
+        <StatCard label="Rondas cargadas" value={cesimRounds.length} />
+        <StatCard label="Última ronda" value={latestRound ? `R${latestRound.roundNumber}` : "—"} />
         {["revenue", "profit"].map((k) => {
           const s = kpiSeries[k]; if (!s) return null;
           const last = s.points[s.points.length - 1], prev = s.points[s.points.length - 2];
@@ -1163,7 +1195,7 @@ function NewsSection({ news, onSave }) {
   );
 }
 
-function ValueMarketShareSection({ rounds }) {
+function ValueMarketShareSection({ rounds, dataById = {}, ourTeam }) {
   const [data, setData] = useState(null);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(null);
@@ -1176,14 +1208,19 @@ function ValueMarketShareSection({ rounds }) {
 
   if (!data) return <div style={{ padding: 20, color: T.textFaint, display: "flex", alignItems: "center", gap: 8 }}><Loader2 size={14} className="spin" /> Cargando…</div>;
 
-  const totalVar = data.totalCur - data.totalPrev;
-  const tec1Var = data.tec1Cur - data.tec1Prev;
-  const tec2Var = data.tec2Cur - data.tec2Prev;
-  const trendData = [{ label: data.labelPrev, value: data.totalPrev }, { label: data.labelCur, value: data.totalCur }];
-  const breakdownChartData = [
-    { tech: "Tec1", variacion: Number(tec1Var.toFixed(2)) },
-    { tech: "Tec2", variacion: Number(tec2Var.toFixed(2)) },
-  ];
+  const series = computeVmsSeries(rounds, dataById, ourTeam, data);
+  const curPt = series[series.length - 1], prevPt = series[series.length - 2];
+  const totalVar = curPt && prevPt ? curPt.total - prevPt.total : null;
+  const trendData = series.map((pt) => ({ label: pt.label, value: Number(pt.total.toFixed(2)) }));
+  const vmsColor = totalVar !== null && totalVar < 0 ? T.red : T.green;
+  // Desglose por tecnología entre las dos últimas rondas disponibles (Tec 1, Tec 2… las que existan).
+  const techNames = [...new Set([...(prevPt ? Object.keys(prevPt.tecs) : []), ...(curPt ? Object.keys(curPt.tecs) : [])])].sort();
+  const breakdownRows = curPt && prevPt ? [
+    ...techNames.map((t) => ({ label: t, prev: prevPt.tecs[t] ?? 0, cur: curPt.tecs[t] ?? 0 })),
+    { label: "Total", prev: prevPt.total, cur: curPt.total },
+  ].map((r) => ({ ...r, v: r.cur - r.prev })) : [];
+  const breakdownChartData = breakdownRows.filter((r) => r.label !== "Total").map((r) => ({ tech: r.label, variacion: Number(r.v.toFixed(2)) }));
+  const manualPoints = series.filter((pt) => pt.source === "manual").map((pt) => pt.label);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
@@ -1195,23 +1232,28 @@ function ValueMarketShareSection({ rounds }) {
         {!editing ? (
           <>
             <div style={{ display: "flex", alignItems: "baseline", gap: 14, marginBottom: 14 }}>
-              <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 32, fontWeight: 700, color: totalVar < 0 ? T.red : T.green }}>{data.totalCur.toFixed(2)}%</div>
-              <div style={{ fontSize: 13, color: T.textDim }}>vs. {data.totalPrev.toFixed(2)}% en {data.labelPrev} <span style={{ fontWeight: 700, color: totalVar < 0 ? T.red : T.green }}>({totalVar >= 0 ? "+" : ""}{totalVar.toFixed(2)} p.p.)</span></div>
+              <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 32, fontWeight: 700, color: vmsColor }}>{curPt ? `${curPt.total.toFixed(2)}%` : "—"}</div>
+              {curPt && prevPt && <div style={{ fontSize: 13, color: T.textDim }}>vs. {prevPt.total.toFixed(2)}% en {prevPt.label} <span style={{ fontWeight: 700, color: vmsColor }}>({totalVar >= 0 ? "+" : ""}{totalVar.toFixed(2)} p.p.)</span></div>}
             </div>
             <div style={{ height: 160 }}>
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart data={trendData}>
                   <CartesianGrid stroke={T.borderSoft} strokeDasharray="3 3" />
                   <XAxis dataKey="label" stroke={T.textFaint} tick={{ fill: T.textDim, fontSize: 11 }} />
-                  <YAxis stroke={T.textFaint} tick={{ fill: T.textDim, fontSize: 11 }} unit="%" />
+                  <YAxis stroke={T.textFaint} tick={{ fill: T.textDim, fontSize: 11 }} unit="%" domain={["auto", "auto"]} />
                   <Tooltip contentStyle={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 8, fontSize: 12 }} formatter={(v) => [`${v}%`, "VMS"]} />
                   <Line dataKey="value" stroke={T.red} strokeWidth={2.5} dot={{ r: 4 }} />
                 </LineChart>
               </ResponsiveContainer>
             </div>
+            <div style={{ fontSize: 11.5, color: T.textFaint, marginTop: 8 }}>
+              El VMS se calcula solo con las rondas cargadas (ingresos de {ourTeam || "tu equipo"} / ingresos de toda la industria).
+              {manualPoints.length > 0 && ` ${manualPoints.join(" y ")} vienen de los datos cargados a mano abajo, hasta que subas esas rondas.`}
+            </div>
           </>
         ) : (
           <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+            <div style={{ width: "100%", fontSize: 12, color: T.textDim }}>Estos datos solo se usan para rondas que todavía no están cargadas (el nombre debe llevar el número, ej. "Año 1" = R1). Las rondas cargadas se calculan solas.</div>
             <div><div style={{ fontSize: 11, color: T.textDim, marginBottom: 4 }}>Etiqueta período anterior</div><input value={draft.labelPrev} onChange={(e) => setDraft({ ...draft, labelPrev: e.target.value })} style={{ ...inputStyle, width: 110, fontFamily: "'Inter', sans-serif" }} /></div>
             <div><div style={{ fontSize: 11, color: T.textDim, marginBottom: 4 }}>Etiqueta período actual</div><input value={draft.labelCur} onChange={(e) => setDraft({ ...draft, labelCur: e.target.value })} style={{ ...inputStyle, width: 110, fontFamily: "'Inter', sans-serif" }} /></div>
             <NumField label="VMS total anterior, %" value={draft.totalPrev} onChange={(v) => setDraft({ ...draft, totalPrev: v })} />
@@ -1242,12 +1284,12 @@ function ValueMarketShareSection({ rounds }) {
           <table style={{ borderCollapse: "collapse", width: "100%", fontFamily: "'IBM Plex Mono', monospace", fontSize: 12.5 }}>
             <thead><tr>
               <th style={{ textAlign: "left", padding: "7px 12px", color: T.textDim, borderBottom: `1px solid ${T.border}` }} />
-              <th style={{ textAlign: "right", padding: "7px 12px", color: T.textDim, borderBottom: `1px solid ${T.border}` }}>{data.labelPrev}</th>
-              <th style={{ textAlign: "right", padding: "7px 12px", color: T.textDim, borderBottom: `1px solid ${T.border}` }}>{data.labelCur}</th>
+              <th style={{ textAlign: "right", padding: "7px 12px", color: T.textDim, borderBottom: `1px solid ${T.border}` }}>{prevPt ? prevPt.label : "—"}</th>
+              <th style={{ textAlign: "right", padding: "7px 12px", color: T.textDim, borderBottom: `1px solid ${T.border}` }}>{curPt ? curPt.label : "—"}</th>
               <th style={{ textAlign: "right", padding: "7px 12px", color: T.textDim, borderBottom: `1px solid ${T.border}` }}>Var.</th>
             </tr></thead>
             <tbody>
-              {[["Tec1", data.tec1Prev, data.tec1Cur, tec1Var], ["Tec2", data.tec2Prev, data.tec2Cur, tec2Var], ["Total", data.totalPrev, data.totalCur, totalVar]].map(([label, prev, cur, v], i) => (
+              {breakdownRows.map(({ label, prev, cur, v }, i) => (
                 <tr key={label} style={{ background: i % 2 ? T.panel : T.panelAlt, fontWeight: label === "Total" ? 700 : 400 }}>
                   <td style={{ padding: "7px 12px", color: T.text }}>{label}</td>
                   <td style={{ padding: "7px 12px", textAlign: "right", color: T.text }}>{prev.toFixed(2)} p.p.</td>
@@ -1469,7 +1511,7 @@ function ourFocusLabel(focus) {
 }
 
 function CompetitionSection({ rounds, dataById, ourTeam, regionFilter = "Global" }) {
-  const cesimRounds = rounds.filter((r) => r.kind === "cesim" && dataById[r.id]);
+  const cesimRounds = sortedCesimRounds(rounds, dataById);
   const [selectedId, setSelectedId] = useState(cesimRounds.length ? cesimRounds[cesimRounds.length - 1].id : null);
   useEffect(() => { if (cesimRounds.length && !cesimRounds.find((r) => r.id === selectedId)) setSelectedId(cesimRounds[cesimRounds.length - 1].id); }, [cesimRounds.map((r) => r.id).join(",")]);
   if (cesimRounds.length === 0) return <div style={{ color: T.textFaint, fontSize: 13, padding: 20 }}>Sin datos todavía.</div>;
@@ -1552,10 +1594,10 @@ function CompetitionSection({ rounds, dataById, ourTeam, regionFilter = "Global"
    PANEL DINÁMICO
 ================================================================= */
 function DynamicDashboard({ rounds, dataById, ourTeam, regionFilter = "Global" }) {
-  const cesimRounds = rounds.filter((r) => r.kind === "cesim" && dataById[r.id]);
+  const cesimRounds = sortedCesimRounds(rounds, dataById);
   const catalog = useMemo(() => buildMetricCatalog(rounds, dataById), [rounds, dataById]);
   const [query, setQuery] = useState(""); const [selected, setSelected] = useState(null); const [selectedTeams, setSelectedTeams] = useState([]);
-  const teams = cesimRounds.length ? dataById[cesimRounds[0].id].teams : [];
+  const teams = cesimRounds.length ? dataById[cesimRounds[cesimRounds.length - 1].id].teams : [];
 
   useEffect(() => {
     if (!ourTeam || !cesimRounds.length || selectedTeams.length) return;
@@ -1751,7 +1793,7 @@ function RoundComment({ roundId }) {
   );
 }
 function StrategySection({ rounds, dataById, ourTeam }) {
-  const cesimRounds = rounds.filter((r) => r.kind === "cesim" && dataById[r.id]);
+  const cesimRounds = sortedCesimRounds(rounds, dataById);
   const [selectedId, setSelectedId] = useState(null);
   const [plan, setPlan] = useState(null); const [form, setForm] = useState({});
   const [snapshot, setSnapshot] = useState(null);
@@ -2088,8 +2130,8 @@ function ShareholderReturnCard({ latestData, prevData, ourTeam, teamIdx }) {
 }
 
 function PromotionTrendCard({ rounds, dataById, ourTeam, teamIdx }) {
-  const cesimRounds = rounds.filter((r) => r.kind === "cesim" && dataById[r.id]);
-  const points = cesimRounds.map((r) => ({ roundNumber: r.roundNumber, value: extractKpi(dataById[r.id], teamIdx, PROMOTION_KPI_DEF) })).filter((p) => p.value !== null);
+  const cesimRounds = sortedCesimRounds(rounds, dataById);
+  const points = seriesByRound(cesimRounds, dataById, ourTeam, (rd, i) => extractKpi(rd, i, PROMOTION_KPI_DEF), teamIdx);
   if (points.length < 2) return null;
   const first = points[0], last = points[points.length - 1];
   const pctChange = first.value !== 0 ? ((last.value - first.value) / Math.abs(first.value)) * 100 : null;
@@ -2189,13 +2231,12 @@ function ClosestRivalsTable({ latestData, ourTeam }) {
     </Panel>
   );
 }
-function KpiTrendChart({ rounds, dataById, teamIdx, regionFilter = "Global" }) {
-  const cesimRounds = rounds.filter((r) => r.kind === "cesim" && dataById[r.id]);
+function KpiTrendChart({ rounds, dataById, teamIdx, ourTeam, regionFilter = "Global" }) {
+  const cesimRounds = sortedCesimRounds(rounds, dataById);
   const kpiDefs = KPI_DEFS.map((d) => (d.key === "share" ? { ...d, blockTitle: regionMarketBlockTitle(regionFilter) } : d));
   const kpiSeries = {};
   kpiDefs.forEach((def) => {
-    const points = [];
-    cesimRounds.forEach((r) => { const v = extractKpi(dataById[r.id], teamIdx, def); if (v !== null) points.push({ roundNumber: r.roundNumber, value: v }); });
+    const points = seriesByRound(cesimRounds, dataById, ourTeam, (rd, i) => extractKpi(rd, i, def), teamIdx);
     if (points.length) kpiSeries[def.key] = { header: def.label, points };
   });
   const kpiKeys = Object.keys(kpiSeries);
@@ -2220,10 +2261,10 @@ function KpiTrendChart({ rounds, dataById, teamIdx, regionFilter = "Global" }) {
 }
 
 function DashboardCompleto({ rounds, dataById, ourTeam, regionFilter = "Global" }) {
-  const cesimRounds = rounds.filter((r) => r.kind === "cesim" && dataById[r.id]);
-  const teamIdx = ourTeam && cesimRounds.length ? cesimRounds[0].teams.indexOf(ourTeam) : -1;
+  const cesimRounds = sortedCesimRounds(rounds, dataById);
   const latestRound = cesimRounds[cesimRounds.length - 1];
   const latestData = latestRound ? dataById[latestRound.id] : null;
+  const teamIdx = teamIndexIn(latestData, ourTeam);
   const prevRound = cesimRounds[cesimRounds.length - 2];
   const prevData = prevRound ? dataById[prevRound.id] : null;
 
@@ -2247,8 +2288,7 @@ function DashboardCompleto({ rounds, dataById, ourTeam, regionFilter = "Global" 
 
   const kpiSeries = {};
   kpiDefs.forEach((def) => {
-    const points = [];
-    cesimRounds.forEach((r) => { const v = extractKpi(dataById[r.id], teamIdx, def); if (v !== null) points.push({ roundNumber: r.roundNumber, value: v }); });
+    const points = seriesByRound(cesimRounds, dataById, ourTeam, (rd, i) => extractKpi(rd, i, def), teamIdx);
     if (points.length) kpiSeries[def.key] = { header: def.label, points };
   });
   const kpiKeys = Object.keys(kpiSeries);
@@ -2274,7 +2314,7 @@ function DashboardCompleto({ rounds, dataById, ourTeam, regionFilter = "Global" 
         })}
       </div>
 
-      <KpiTrendChart rounds={rounds} dataById={dataById} teamIdx={teamIdx} regionFilter={regionFilter} />
+      <KpiTrendChart rounds={rounds} dataById={dataById} teamIdx={teamIdx} ourTeam={ourTeam} regionFilter={regionFilter} />
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: 14 }}>
         <PositioningMap roundData={latestData} ourTeam={ourTeam} region={regionFilter} />
@@ -2303,7 +2343,7 @@ function DashboardCompleto({ rounds, dataById, ourTeam, regionFilter = "Global" 
    ASISTENTE IA
 ================================================================= */
 function buildAiContext(rounds, dataById, ourTeam, plan, premises) {
-  const cesimRounds = rounds.filter((r) => r.kind === "cesim" && dataById[r.id]);
+  const cesimRounds = sortedCesimRounds(rounds, dataById);
   // Build the round list newest-first and keep adding older rounds only
   // while they fit a safe character budget. This guarantees the MOST
   // RECENT round is never the one that gets cut — unlike a blind
@@ -2327,7 +2367,7 @@ function buildAiContext(rounds, dataById, ourTeam, plan, premises) {
   };
 }
 function AiAssistant({ rounds, dataById, ourTeam }) {
-  const cesimRounds = rounds.filter((r) => r.kind === "cesim" && dataById[r.id]);
+  const cesimRounds = sortedCesimRounds(rounds, dataById);
   const [premises, setPremises] = useState([]); const [plan, setPlan] = useState(null);
   const [messages, setMessages] = useState([]); const [input, setInput] = useState(""); const [busy, setBusy] = useState(false); const [err, setErr] = useState("");
   useEffect(() => { loadStrategyPlan().then(setPlan); }, []);
@@ -2496,7 +2536,7 @@ function findBaseRow(block, stmtDef) {
 }
 
 function AnalisisFinancieroSection({ rounds, dataById, ourTeam, regionFilter = "Global" }) {
-  const cesimRounds = rounds.filter((r) => r.kind === "cesim" && dataById[r.id]);
+  const cesimRounds = sortedCesimRounds(rounds, dataById);
   const [stmtKey, setStmtKey] = useState("pl");
   const [viewMode, setViewMode] = useState("valores"); // valores | vertical | horizontal
 
@@ -2509,8 +2549,6 @@ function AnalisisFinancieroSection({ rounds, dataById, ourTeam, regionFilter = "
   };
   const effectiveStmtKey = statements[stmtKey] ? stmtKey : "pl";
   const stmtDef = statements[effectiveStmtKey];
-  const teamIdx = cesimRounds[0].teams.indexOf(ourTeam);
-
   const refRound = cesimRounds[cesimRounds.length - 1];
   const refBlock = dataById[refRound.id].blocks.find((b) => b.title === stmtDef.blockTitle);
 
@@ -2519,17 +2557,19 @@ function AnalisisFinancieroSection({ rounds, dataById, ourTeam, regionFilter = "
     const metricRows = refBlock.rows.filter((r) => r.kind === "metric");
     return metricRows.map((refRow) => {
       const perRound = cesimRounds.map((r) => {
-        const block = dataById[r.id].blocks.find((b) => b.title === stmtDef.blockTitle);
+        const rd = dataById[r.id];
+        const idx = teamIndexIn(rd, ourTeam);
+        const block = rd.blocks.find((b) => b.title === stmtDef.blockTitle);
         const row = block ? findMetricRow(block, refRow.label) : null;
         const base = findBaseRow(block, stmtDef);
-        const value = row ? toNumberOrNull(row.values[teamIdx]) : null;
-        const baseValue = base ? toNumberOrNull(base.values[teamIdx]) : null;
+        const value = row && idx >= 0 ? toNumberOrNull(row.values[idx]) : null;
+        const baseValue = base && idx >= 0 ? toNumberOrNull(base.values[idx]) : null;
         return { roundNumber: r.roundNumber, value, baseValue };
       });
       return { label: refRow.label, perRound };
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refBlock, cesimRounds, dataById, teamIdx, effectiveStmtKey, regionFilter]);
+  }, [refBlock, cesimRounds, dataById, ourTeam, effectiveStmtKey, regionFilter]);
 
   const hasBase = !!(stmtDef.baseLabel || stmtDef.baseLabelPattern);
 
@@ -2607,25 +2647,67 @@ function AnalisisFinancieroSection({ rounds, dataById, ourTeam, regionFilter = "
    RESUMEN PARA ACCIONISTAS — pick real widgets from other tabs into
    one board; double-click a block to jump to where it lives.
 ================================================================= */
-function VmsTrendWidget() {
+// VMS = ingresos de nuestro equipo / ingresos totales de la industria (P&L global). El desglose por
+// tecnología usa los ingresos por tec de cada región sobre el mismo total de la industria.
+function computeVmsPoint(rd, teamIdx) {
+  const row = findMetricRow(rd.blocks.find((b) => b.title === "Cuenta de resultados, miles USD, Global"), "Ingresos por ventas");
+  if (!row) return null;
+  const total = row.values.reduce((a, v) => a + (typeof v === "number" ? v : 0), 0);
+  const mine = toNumberOrNull(row.values[teamIdx]);
+  if (!total || mine === null) return null;
+  const tecs = {};
+  techsInRound(rd).forEach((tec) => {
+    let sum = 0;
+    MARKET_REGIONS.forEach(({ key }) => {
+      const blk = rd.blocks.find((bl) => bl.title === `Desglose de margen por tec, miles USD, ${key}`);
+      sum += getMetricUnderGroup(blk, tec, "Ingresos por ventas", teamIdx) || 0;
+    });
+    if (sum > 0) tecs[tec] = (sum / total) * 100;
+  });
+  return { total: (mine / total) * 100, tecs };
+}
+// Rondas cargadas → se calculan solas. Los datos cargados a mano ("Año 1", "Año 2"…) solo completan
+// las rondas que no están cargadas, y se reemplazan al subir esas rondas.
+function computeVmsSeries(rounds, dataById, ourTeam, manual) {
+  const points = new Map();
+  sortedCesimRounds(rounds, dataById).forEach((r) => {
+    const rd = dataById[r.id], idx = rd.teams.indexOf(ourTeam);
+    const pt = idx >= 0 ? computeVmsPoint(rd, idx) : null;
+    if (pt) points.set(r.roundNumber, { roundNumber: r.roundNumber, label: `R${r.roundNumber}`, ...pt, source: "calc" });
+  });
+  if (manual) {
+    [[manual.labelPrev, manual.totalPrev, manual.tec1Prev, manual.tec2Prev], [manual.labelCur, manual.totalCur, manual.tec1Cur, manual.tec2Cur]].forEach(([label, total, t1, t2]) => {
+      const m = /(\d+)/.exec(label || ""), n = m ? parseInt(m[1], 10) : null;
+      if (n === null || points.has(n) || !Number.isFinite(total)) return;
+      points.set(n, { roundNumber: n, label: `R${n}`, total, tecs: { "Tec 1": t1, "Tec 2": t2 }, source: "manual" });
+    });
+  }
+  return [...points.values()].sort((x, y) => x.roundNumber - y.roundNumber);
+}
+
+function VmsTrendWidget({ rounds = [], dataById = {}, ourTeam }) {
   const [data, setData] = useState(null);
   useEffect(() => { loadVmsData().then((d) => setData(d || DEFAULT_VMS_DATA)); }, []);
   if (!data) return null;
-  const totalVar = data.totalCur - data.totalPrev;
-  const trendData = [{ label: data.labelPrev, value: data.totalPrev }, { label: data.labelCur, value: data.totalCur }];
+  const series = computeVmsSeries(rounds, dataById, ourTeam, data);
+  const cur = series[series.length - 1], prev = series[series.length - 2];
+  if (!cur) return null;
+  const totalVar = prev ? cur.total - prev.total : null;
+  const trendData = series.map((pt) => ({ label: pt.label, value: Number(pt.total.toFixed(2)) }));
+  const color = totalVar !== null && totalVar < 0 ? T.red : T.green;
   return (
     <Panel style={{ padding: 18 }}>
-      <Eyebrow info="Cuota de mercado en VALOR — qué % de los ingresos totales del mercado captura ULTI.">Cuota de valor de mercado (VMS)</Eyebrow>
+      <Eyebrow info="Cuota de mercado en VALOR — qué % de los ingresos totales del mercado captura ULTI. Se calcula sola con las rondas cargadas.">Cuota de valor de mercado (VMS)</Eyebrow>
       <div style={{ display: "flex", alignItems: "baseline", gap: 14, marginBottom: 12 }}>
-        <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 28, fontWeight: 700, color: totalVar < 0 ? T.red : T.green }}>{data.totalCur.toFixed(2)}%</div>
-        <div style={{ fontSize: 12.5, color: T.textDim }}>vs. {data.totalPrev.toFixed(2)}% en {data.labelPrev} <span style={{ fontWeight: 700, color: totalVar < 0 ? T.red : T.green }}>({totalVar >= 0 ? "+" : ""}{totalVar.toFixed(2)} p.p.)</span></div>
+        <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 28, fontWeight: 700, color }}>{cur.total.toFixed(2)}%</div>
+        {prev && <div style={{ fontSize: 12.5, color: T.textDim }}>vs. {prev.total.toFixed(2)}% en {prev.label} <span style={{ fontWeight: 700, color }}>({totalVar >= 0 ? "+" : ""}{totalVar.toFixed(2)} p.p.)</span></div>}
       </div>
       <div style={{ height: 140 }}>
         <ResponsiveContainer width="100%" height="100%">
           <LineChart data={trendData}>
             <CartesianGrid stroke={T.borderSoft} strokeDasharray="3 3" />
             <XAxis dataKey="label" stroke={T.textFaint} tick={{ fill: T.textDim, fontSize: 11 }} />
-            <YAxis stroke={T.textFaint} tick={{ fill: T.textDim, fontSize: 11 }} unit="%" />
+            <YAxis stroke={T.textFaint} tick={{ fill: T.textDim, fontSize: 11 }} unit="%" domain={["auto", "auto"]} />
             <Tooltip contentStyle={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 8, fontSize: 12 }} formatter={(v) => [`${v}%`, "VMS"]} />
             <Line dataKey="value" stroke={T.red} strokeWidth={2.5} dot={{ r: 4 }} />
           </LineChart>
@@ -2674,13 +2756,13 @@ function PlanWidget() {
 const SUMMARY_WIDGETS = [
   { id: "resumen-ejecutivo", label: "Resumen ejecutivo", sourceTab: "dashboard", Component: (ctx) => <ExecutiveSummaryCard lines={buildExecutiveSummary(ctx.latestData, ctx.prevData, ctx.teamIdx, ctx.ourTeam, ctx.latestRound)} ourTeam={ctx.ourTeam} /> },
   { id: "retorno-accionista", label: "Retorno al accionista", sourceTab: "dashboard", Component: (ctx) => <ShareholderReturnCard latestData={ctx.latestData} prevData={ctx.prevData} ourTeam={ctx.ourTeam} teamIdx={ctx.teamIdx} /> },
-  { id: "tendencia-kpis", label: "Tendencia de indicadores", sourceTab: "dashboard", Component: (ctx) => <KpiTrendChart rounds={ctx.rounds} dataById={ctx.dataById} teamIdx={ctx.teamIdx} regionFilter={ctx.regionFilter} /> },
+  { id: "tendencia-kpis", label: "Tendencia de indicadores", sourceTab: "dashboard", Component: (ctx) => <KpiTrendChart rounds={ctx.rounds} dataById={ctx.dataById} teamIdx={ctx.teamIdx} ourTeam={ctx.ourTeam} regionFilter={ctx.regionFilter} /> },
   { id: "rivales-cercanos", label: "Rivales más cercanos", sourceTab: "dashboard", Component: (ctx) => <ClosestRivalsTable latestData={ctx.latestData} ourTeam={ctx.ourTeam} /> },
   { id: "mapa-posicionamiento", label: "Mapa de posicionamiento", sourceTab: "competencia", Component: (ctx) => <PositioningMap roundData={ctx.latestData} ourTeam={ctx.ourTeam} region={ctx.regionFilter} /> },
   { id: "mix-tecnologia", label: "Mix de tecnología", sourceTab: "competencia", Component: (ctx) => <TechMixChart roundData={ctx.latestData} ourTeam={ctx.ourTeam} region={ctx.regionFilter} /> },
   { id: "enfoque-marca", label: "Enfoque de marca — comparación de precios", sourceTab: "competencia", Component: (ctx) => <CompetitorFocusTable roundData={ctx.latestData} ourTeam={ctx.ourTeam} /> },
   { id: "todo-el-mercado", label: "Todo el mercado", sourceTab: "competencia", Component: (ctx) => <MarketOverviewTable roundData={{ ...ctx.latestData, roundNumber: ctx.latestRound.roundNumber }} ourTeam={ctx.ourTeam} /> },
-  { id: "vms", label: "Cuota de valor de mercado (VMS)", sourceTab: "general", Component: () => <VmsTrendWidget /> },
+  { id: "vms", label: "Cuota de valor de mercado (VMS)", sourceTab: "general", Component: (ctx) => <VmsTrendWidget rounds={ctx.rounds} dataById={ctx.dataById} ourTeam={ctx.ourTeam} /> },
   { id: "novedades", label: "Novedades del entorno", sourceTab: "general", Component: () => <NewsWidget /> },
   { id: "plan-estrategico", label: "Plan estratégico — precios estimados", sourceTab: "estrategia", Component: () => <PlanWidget /> },
   { id: "promocion-evolucion", label: "Evolución del gasto de promoción", sourceTab: "dashboard", Component: (ctx) => <PromotionTrendCard rounds={ctx.rounds} dataById={ctx.dataById} ourTeam={ctx.ourTeam} teamIdx={ctx.teamIdx} /> },
@@ -2694,10 +2776,10 @@ async function loadSummaryBoard() {
 async function saveSummaryBoard(ids) { await storage.set("summary-board", JSON.stringify(ids)); }
 
 function AccionistasSummarySection({ rounds, dataById, ourTeam, regionFilter, onNavigate }) {
-  const cesimRounds = rounds.filter((r) => r.kind === "cesim" && dataById[r.id]);
-  const teamIdx = ourTeam && cesimRounds.length ? cesimRounds[0].teams.indexOf(ourTeam) : -1;
+  const cesimRounds = sortedCesimRounds(rounds, dataById);
   const latestRound = cesimRounds[cesimRounds.length - 1];
   const latestData = latestRound ? dataById[latestRound.id] : null;
+  const teamIdx = teamIndexIn(latestData, ourTeam);
   const prevRound = cesimRounds[cesimRounds.length - 2];
   const prevData = prevRound ? dataById[prevRound.id] : null;
 
@@ -2825,7 +2907,7 @@ function BlockTable({ block, teams, ourTeam }) {
   );
 }
 function CategorySection({ category, rounds, dataById, ourTeam, regionFilter = "Global" }) {
-  const cesimRounds = rounds.filter((r) => r.kind === "cesim" && dataById[r.id]);
+  const cesimRounds = sortedCesimRounds(rounds, dataById);
   const [selectedId, setSelectedId] = useState(cesimRounds.length ? cesimRounds[cesimRounds.length - 1].id : null);
   useEffect(() => { if (cesimRounds.length && !cesimRounds.find((r) => r.id === selectedId)) setSelectedId(cesimRounds[cesimRounds.length - 1].id); }, [cesimRounds.map((r) => r.id).join(",")]);
   if (cesimRounds.length === 0) return <div style={{ color: T.textFaint, fontSize: 13, padding: 20 }}>Sin datos todavía.</div>;
@@ -2894,7 +2976,7 @@ function fmtSigned(n, digits = 1, suffix = "") { return Number.isFinite(n) ? `${
 function avg(list) { const xs = list.filter((v) => Number.isFinite(v)); return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null; }
 
 function getRoundContext(rounds, dataById, ourTeam) {
-  const cesimRounds = rounds.filter((r) => r.kind === "cesim" && dataById[r.id]);
+  const cesimRounds = sortedCesimRounds(rounds, dataById);
   const latestRound = cesimRounds[cesimRounds.length - 1] || null;
   const prevRound = cesimRounds[cesimRounds.length - 2] || null;
   const latestData = latestRound ? dataById[latestRound.id] : null;
@@ -2982,12 +3064,12 @@ function rankAmongTeams(roundData, getter, ourIdx) {
 function computeTrafficLights(cur, prev, teamIdx, regionFilter = "Global") {
   const lights = [];
 
-  // 1) Fill rate = ventas / demanda (unidades)
+  // 1) Cobertura de demanda = ventas / demanda (unidades)
   const rows = computeMarketRows(cur, teamIdx).filter((r) => regionFilter === "Global" || r.region === regionFilter);
   const sales = rows.reduce((a, r) => a + (r.sales || 0), 0), demand = rows.reduce((a, r) => a + (r.demand || 0), 0);
   const fill = demand > 0 ? (sales / demand) * 100 : null;
   lights.push({
-    key: "fill", label: `Fill rate ${regionFilter === "Global" ? "global" : regionFilter}`, hint: "Verde ≥95% · Amarillo 80–95% · Rojo <80%",
+    key: "fill", label: `Cobertura de demanda ${regionFilter === "Global" ? "global" : regionFilter}`, hint: "Verde ≥95% · Amarillo 80–95% · Rojo <80%",
     value: fill === null ? null : fmtPct(fill), status: fill === null ? "none" : fill >= 95 ? "green" : fill >= 80 ? "yellow" : "red",
     detail: fill === null ? "" : `${fmtInt(sales)} vendidas de ${fmtInt(demand)} demandadas (miles u.)`,
   });
@@ -3111,6 +3193,8 @@ function DesvioPresupuestarioCard({ latestData, teamIdx, regionFilter }) {
     return { ...r, estRevenue, demandDev: r.estDemand > 0 && r.demand !== null ? ((r.demand - r.estDemand) / r.estDemand) * 100 : null, revDiff: estRevenue !== null && r.revenue !== null ? r.revenue - estRevenue : null };
   });
   const total = computeRevenueDeviation(latestData, teamIdx);
+  const totEstUnits = rows.reduce((a, r) => a + (r.estDemand || 0), 0), totRealUnits = rows.reduce((a, r) => a + (r.demand || 0), 0);
+  const totUnitsDev = totEstUnits > 0 ? ((totRealUnits - totEstUnits) / totEstUnits) * 100 : null;
   const estProfitRow = findMetricAnywhere(latestData, /^Ingresos netos proyectados/i);
   const estProfit = estProfitRow ? toNumberOrNull(estProfitRow.values[teamIdx]) : null;
   const realProfit = getKpiByKey(latestData, "profit", teamIdx);
@@ -3138,9 +3222,9 @@ function DesvioPresupuestarioCard({ latestData, teamIdx, regionFilter }) {
             {regionFilter === "Global" && total && (
               <tr style={{ background: T.amberDim, fontWeight: 700 }}>
                 <td style={{ ...td, textAlign: "left", color: T.amber }} colSpan={2}>Total compañía</td>
-                <td style={td}>—</td><td style={td}>—</td><td style={td}><DevCell pct={total.pct} /></td>
+                <td style={td}>{fmtInt(totEstUnits)}</td><td style={td}>{fmtInt(totRealUnits)}</td><td style={td}><DevCell pct={totUnitsDev} /></td>
                 <td style={td}>{fmtInt(total.est)}</td><td style={td}>{fmtInt(total.real)}</td>
-                <td style={{ ...td, color: total.diff >= 0 ? T.green : T.red }}>{`${total.diff >= 0 ? "+" : ""}${fmtInt(total.diff)}`}</td>
+                <td style={{ ...td, color: total.diff >= 0 ? T.green : T.red }}>{`${total.diff >= 0 ? "+" : ""}${fmtInt(total.diff)}`} <span style={{ fontWeight: 400 }}>({fmtSigned(total.pct, 1, "%")})</span></td>
               </tr>
             )}
           </tbody>
@@ -3264,7 +3348,7 @@ function PreciosCompetenciaCard({ latestData, ourTeam, regionFilter }) {
   );
 }
 
-function FillRateCard({ latestData, teamIdx, regionFilter }) {
+function CoberturaDemandaCard({ latestData, teamIdx, regionFilter }) {
   if (!latestData || teamIdx < 0) return null;
   const rows = computeMarketRows(latestData, teamIdx).filter((r) => regionFilter === "Global" || r.region === regionFilter)
     .map((r) => ({ ...r, fill: r.demand > 0 ? ((r.sales || 0) / r.demand) * 100 : null, lost: Math.max(0, (r.demand || 0) - (r.sales || 0)) }));
@@ -3274,10 +3358,10 @@ function FillRateCard({ latestData, teamIdx, regionFilter }) {
   const Dot = ({ s }) => <span style={{ display: "inline-block", width: 10, height: 10, borderRadius: "50%", background: TL_COLORS[s], verticalAlign: "middle" }} />;
   return (
     <Panel style={{ padding: 0, overflow: "hidden" }}>
-      <div style={{ padding: "14px 16px 8px" }}><Eyebrow info="Fill rate = ventas / demanda, en miles de unidades. Verde ≥95%, amarillo 80–95%, rojo <80%. Las unidades perdidas son demanda que no pudimos atender.">Fill rate por mercado y tecnología</Eyebrow></div>
+      <div style={{ padding: "14px 16px 8px" }}><Eyebrow info="Cobertura de demanda = ventas / demanda, en miles de unidades. Verde ≥95%, amarillo 80–95%, rojo <80%. Las unidades perdidas son demanda que no pudimos atender.">Cobertura de demanda por mercado y tecnología</Eyebrow></div>
       <div style={{ overflowX: "auto" }}>
         <table style={MONO_TABLE}>
-          <thead><tr><th style={{ ...TH, textAlign: "left" }}>Mercado</th><th style={{ ...TH, textAlign: "left" }}>Tec</th><th style={TH}>Demanda</th><th style={TH}>Ventas</th><th style={TH}>Fill rate</th><th style={TH}>Unidades perdidas</th></tr></thead>
+          <thead><tr><th style={{ ...TH, textAlign: "left" }}>Mercado</th><th style={{ ...TH, textAlign: "left" }}>Tec</th><th style={TH}>Demanda</th><th style={TH}>Ventas</th><th style={TH}>Cobertura</th><th style={TH}>Unidades perdidas</th></tr></thead>
           <tbody>
             {rows.map((r, i) => (
               <tr key={r.region + r.tec} style={{ background: i % 2 ? T.panel : T.panelAlt }}>
@@ -3304,7 +3388,7 @@ function FillRateCard({ latestData, teamIdx, regionFilter }) {
 }
 
 function CuotaEvolucionChart({ rounds, dataById, ourTeam, regionFilter }) {
-  const cesim = rounds.filter((r) => r.kind === "cesim" && dataById[r.id]).sort((a, b) => a.roundNumber - b.roundNumber);
+  const cesim = sortedCesimRounds(rounds, dataById);
   if (!cesim.length) return null;
   const teams = dataById[cesim[cesim.length - 1].id].teams;
   const data = cesim.map((r) => {
@@ -3561,7 +3645,7 @@ function CapitalStructureCard({ latestData, ourTeam }) {
 }
 
 function CreditRatingEvolutionCard({ rounds, dataById, ourTeam }) {
-  const cesim = rounds.filter((r) => r.kind === "cesim" && dataById[r.id]).sort((a, b) => a.roundNumber - b.roundNumber);
+  const cesim = sortedCesimRounds(rounds, dataById);
   if (!cesim.length) return null;
   const teams = dataById[cesim[cesim.length - 1].id].teams;
   return (
@@ -3631,7 +3715,7 @@ const RATIO_PANEL = [
 ];
 
 function RatiosClaveCard({ rounds, dataById, ourTeam }) {
-  const cesim = rounds.filter((r) => r.kind === "cesim" && dataById[r.id]).sort((a, b) => a.roundNumber - b.roundNumber);
+  const cesim = sortedCesimRounds(rounds, dataById);
   if (!cesim.length) return null;
   const latest = dataById[cesim[cesim.length - 1].id], ourIdx = latest.teams.indexOf(ourTeam);
   if (ourIdx < 0) return null;
@@ -3815,12 +3899,12 @@ function MercadoTab({ rounds, dataById, ourTeam, regionFilter, categories }) {
           <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
             <CuotasHeatmapCard latestData={latestData} ourTeam={ourTeam} regionFilter={regionFilter} />
             <PreciosCompetenciaCard latestData={latestData} ourTeam={ourTeam} regionFilter={regionFilter} />
-            <FillRateCard latestData={latestData} teamIdx={teamIdx} regionFilter={regionFilter} />
+            <CoberturaDemandaCard latestData={latestData} teamIdx={teamIdx} regionFilter={regionFilter} />
             <CuotaEvolucionChart rounds={rounds} dataById={dataById} ourTeam={ourTeam} regionFilter={regionFilter} />
           </div>
         </TabSection>
       )}
-      <TabSection title="Cuota de valor de mercado (VMS) y novedades del entorno"><ValueMarketShareSection rounds={rounds} /></TabSection>
+      <TabSection title="Cuota de valor de mercado (VMS) y novedades del entorno"><ValueMarketShareSection rounds={rounds} dataById={dataById} ourTeam={ourTeam} /></TabSection>
       <TabSection title="Competencia"><CompetitionSection rounds={rounds} dataById={dataById} ourTeam={ourTeam} regionFilter={regionFilter} /></TabSection>
       {categories.includes("Mercado") && <TabSection title="Informes de mercado (detalle del simulador)"><CategorySection category="Mercado" rounds={rounds} dataById={dataById} ourTeam={ourTeam} regionFilter={regionFilter} /></TabSection>}
     </>
