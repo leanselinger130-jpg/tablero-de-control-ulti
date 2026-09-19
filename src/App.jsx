@@ -1284,8 +1284,8 @@ function ValueMarketShareSection({ rounds, dataById = {}, ourTeam }) {
           <table style={{ borderCollapse: "collapse", width: "100%", fontFamily: "'IBM Plex Mono', monospace", fontSize: 12.5 }}>
             <thead><tr>
               <th style={{ textAlign: "left", padding: "7px 12px", color: T.textDim, borderBottom: `1px solid ${T.border}` }} />
-              <th style={{ textAlign: "right", padding: "7px 12px", color: T.textDim, borderBottom: `1px solid ${T.border}` }}>{prevPt ? prevPt.label : "—"}</th>
-              <th style={{ textAlign: "right", padding: "7px 12px", color: T.textDim, borderBottom: `1px solid ${T.border}` }}>{curPt ? curPt.label : "—"}</th>
+              <th style={{ textAlign: "right", padding: "7px 12px", color: T.textDim, borderBottom: `1px solid ${T.border}` }}>{prevPt ? <>{prevPt.label}{prevPt.source === "manual" && <ManualTag />}</> : "—"}</th>
+              <th style={{ textAlign: "right", padding: "7px 12px", color: T.textDim, borderBottom: `1px solid ${T.border}` }}>{curPt ? <>{curPt.label}{curPt.source === "manual" && <ManualTag />}</> : "—"}</th>
               <th style={{ textAlign: "right", padding: "7px 12px", color: T.textDim, borderBottom: `1px solid ${T.border}` }}>Var.</th>
             </tr></thead>
             <tbody>
@@ -2683,6 +2683,12 @@ function computeVmsSeries(rounds, dataById, ourTeam, manual) {
     });
   }
   return [...points.values()].sort((x, y) => x.roundNumber - y.roundNumber);
+}
+
+// Marca las cifras que NO salen del .xls. El archivo del simulador es siempre la fuente de verdad:
+// lo cargado a mano sólo rellena rondas todavía no subidas y se reemplaza al subirlas.
+function ManualTag() {
+  return <span title="Cargado a mano: se reemplaza solo al subir el .xls de esa ronda" style={{ marginLeft: 5, fontSize: 9.5, fontWeight: 600, letterSpacing: "0.04em", padding: "1px 5px", borderRadius: 20, background: T.panelAlt, border: `1px solid ${T.border}`, color: T.textFaint, verticalAlign: "middle" }}>A MANO</span>;
 }
 
 function VmsTrendWidget({ rounds = [], dataById = {}, ourTeam }) {
@@ -4112,6 +4118,7 @@ function DecisionRegistrySection({ rounds, dataById, ourTeam }) {
   const [dirty, setDirty] = useState(false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [pendingRound, setPendingRound] = useState(null);
 
   // La próxima ronda siempre está disponible aunque todavía no existan sus resultados.
   const nextNumber = (playedNumbers.length ? Math.max(...playedNumbers) : 0) + 1;
@@ -4142,12 +4149,24 @@ function DecisionRegistrySection({ rounds, dataById, ourTeam }) {
     setDirty(false);
   }, [selected, loading]);
 
+  // También avisa si intentan cerrar o recargar la pestaña con cambios sin guardar.
+  useEffect(() => {
+    if (!dirty) return;
+    const onLeave = (e) => { e.preventDefault(); e.returnValue = ""; };
+    window.addEventListener("beforeunload", onLeave);
+    return () => window.removeEventListener("beforeunload", onLeave);
+  }, [dirty]);
+
   const save = async () => {
     setSaving(true);
     await saveDecisionsFor(selected, draft);
     setByRound((prev) => ({ ...prev, [selected]: draft }));
     setDirty(false); setSaving(false);
   };
+  // Cambiar de ronda con cambios sin guardar los perdería: se avisa antes.
+  const requestRound = (n) => { if (n === selected) return; if (dirty) setPendingRound(n); else setSelected(n); };
+  const saveAndSwitch = async () => { const n = pendingRound; await save(); setPendingRound(null); setSelected(n); };
+  const discardAndSwitch = () => { const n = pendingRound; setPendingRound(null); setDirty(false); setSelected(n); };
   const copyPrevious = () => {
     const prevNums = roundNumbers.filter((n) => n < selected && byRound[n]);
     const from = prevNums[prevNums.length - 1];
@@ -4172,7 +4191,7 @@ function DecisionRegistrySection({ rounds, dataById, ourTeam }) {
             const played = playedNumbers.includes(n);
             const has = !!byRound[n];
             return (
-              <button key={n} onClick={() => setSelected(n)} title={played ? "Ronda con resultados cargados" : "Ronda sin resultados todavía"}
+              <button key={n} onClick={() => requestRound(n)} title={played ? "Ronda con resultados cargados" : "Ronda sin resultados todavía"}
                 style={{ padding: "6px 12px", borderRadius: 7, fontSize: 12.5, cursor: "pointer", fontWeight: 600, display: "flex", alignItems: "center", gap: 6,
                   border: `1px solid ${n === selected ? T.amber : T.border}`, background: n === selected ? T.amberDim : "transparent", color: n === selected ? T.amber : T.textDim }}>
                 R{n}
@@ -4207,6 +4226,20 @@ function DecisionRegistrySection({ rounds, dataById, ourTeam }) {
       )}
 
       <DecisionTimeline byRound={byRound} techs={techs} playedRounds={playedNumbers} />
+
+      {pendingRound !== null && (
+        <div style={{ position: "fixed", inset: 0, background: T.overlay, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 60, padding: 20 }}>
+          <Panel style={{ padding: 22, maxWidth: 400 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}><AlertTriangle size={16} color={T.amber} /><span style={{ fontWeight: 600, fontSize: 14 }}>Cambios sin guardar</span></div>
+            <div style={{ fontSize: 13, color: T.textDim, marginBottom: 16 }}>Tenés cambios sin guardar en las decisiones de la ronda {selected}. Si vas a la ronda {pendingRound} sin guardar, se pierden.</div>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+              <button onClick={saveAndSwitch} disabled={saving} style={primaryBtn}>{saving ? <Loader2 size={13} className="spin" /> : <CheckCircle2 size={13} />} Guardar y cambiar</button>
+              <button onClick={discardAndSwitch} style={{ ...ghostBtn, color: T.red, borderColor: T.red }}>Descartar cambios</button>
+              <button onClick={() => setPendingRound(null)} style={ghostBtn}>Cancelar</button>
+            </div>
+          </Panel>
+        </div>
+      )}
     </div>
   );
 }
