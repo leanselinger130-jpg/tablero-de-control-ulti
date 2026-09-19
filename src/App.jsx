@@ -3863,6 +3863,354 @@ function RatiosValoracionCards({ rounds, dataById, ourTeam, regionFilter }) {
   );
 }
 
+/* ---------------------------------------------------------------
+   DECISIONES Y REGISTRO
+   Las decisiones se toman ANTES de conocer los resultados, así que este registro no depende
+   de que el .xls de esa ronda esté cargado: se guarda por NÚMERO de ronda. Cuando después se
+   suba el archivo de esa ronda, las decisiones ya cargadas quedan enganchadas solas.
+--------------------------------------------------------------- */
+const FACTORY_REGIONS = ["EE.UU.", "Asia"]; // Europa no tiene fábricas propias en Cesim
+
+async function loadDecisions(n) {
+  try { const res = await storage.get(`decisions:r${n}`); return res ? JSON.parse(res.value) : null; } catch { return null; }
+}
+async function saveDecisionsFor(n, data) { await storage.set(`decisions:r${n}`, JSON.stringify(data)); }
+async function listDecisionRounds() {
+  try {
+    const res = await storage.list("decisions:r");
+    return (res?.keys || []).map((k) => parseInt(String(k).replace("decisions:r", ""), 10)).filter(Number.isFinite);
+  } catch { return []; }
+}
+const emptyDecisions = (n) => ({ roundNumber: n, markets: {}, promo: {}, factories: {}, rd: {}, finance: {}, notes: "" });
+const mk = (region, tec) => `${region}|${tec}`;
+
+// Igual que getMetricUnderGroup, pero sigue leyendo aunque haya subgrupos intermedios
+// (en el desglose de margen, "Promoción" cuelga de "Tec N" pero va después de "Costos y gastos").
+function getMetricUnderTech(block, tec, label, teamIdx) {
+  if (!block) return null;
+  const rows = block.rows;
+  const start = rows.findIndex((r) => r.kind === "group" && r.label === tec);
+  if (start < 0) return null;
+  for (let i = start + 1; i < rows.length; i++) {
+    const r = rows[i];
+    if (r.kind === "group" && /^Tec \d+/.test(r.label)) break;
+    if (r.kind === "metric" && r.label === label) return toNumberOrNull(r.values[teamIdx]);
+  }
+  return null;
+}
+
+// Lo que realmente pasó en esa ronda (si el .xls ya está cargado), para contrastar con lo decidido.
+function actualsForRound(roundData, ourTeam) {
+  if (!roundData) return null;
+  const idx = teamIndexIn(roundData, ourTeam);
+  if (idx < 0) return null;
+  const out = { markets: {}, promo: {} };
+  MARKET_REGIONS.forEach(({ key, currency }) => {
+    const block = roundData.blocks.find((b) => b.title === regionMarketBlockTitle(key));
+    techsInRound(roundData).forEach((tec) => {
+      out.markets[mk(key, tec)] = {
+        price: getMetricUnderGroup(block, tec, `Precio de venta, ${currency}`, idx),
+        features: getMetricUnderGroup(block, tec, "Cantidad de características ofrecidas", idx),
+        focus: getRawMetricUnderGroup(block, tec, "Enfoque de la estrategia de marketing", idx),
+      };
+    });
+    const marginBlock = roundData.blocks.find((b) => b.title === `Desglose de margen por tec, miles USD, ${key}`);
+    let promo = 0;
+    techsInRound(roundData).forEach((tec) => { promo += getMetricUnderTech(marginBlock, tec, "Promoción", idx) || 0; });
+    if (promo > 0) out.promo[key] = promo;
+  });
+  out.rdSpend = getMetricUnderGroup(roundData.blocks.find((b) => b.title === "Cuenta de resultados, miles USD, Global"), "Costos y gastos", "I+D", idx)
+    ?? (findMetricRow(roundData.blocks.find((b) => b.title === "Cuenta de resultados, miles USD, Global"), "I+D")?.values[idx] ?? null);
+  return out;
+}
+
+function RealHint({ value, fmt = (v) => fmtDec(v, 0) }) {
+  if (value === null || value === undefined || value === "") return null;
+  return <div style={{ fontSize: 10.5, color: T.textFaint, marginTop: 3 }}>real: {typeof value === "number" ? fmt(value) : String(value)}</div>;
+}
+function TextField({ label, value, onChange, width, placeholder }) {
+  return (
+    <div>
+      <div style={{ fontSize: 11, color: T.textDim, marginBottom: 4 }}>{label}</div>
+      <input value={value ?? ""} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} style={{ ...inputStyle, width: width || 130, fontFamily: "'Inter', sans-serif" }} />
+    </div>
+  );
+}
+function SelectField({ label, value, onChange, options, width }) {
+  return (
+    <div>
+      <div style={{ fontSize: 11, color: T.textDim, marginBottom: 4 }}>{label}</div>
+      <select value={value ?? ""} onChange={(e) => onChange(e.target.value || null)} style={{ ...inputStyle, width: width || 150, fontFamily: "'Inter', sans-serif", cursor: "pointer" }}>
+        <option value="">—</option>
+        {options.map((o) => <option key={o} value={o}>{o}</option>)}
+      </select>
+    </div>
+  );
+}
+function FieldGroup({ title, children }) {
+  return (
+    <div style={{ marginBottom: 6 }}>
+      <div style={{ fontSize: 12, fontWeight: 700, color: T.text, marginBottom: 8 }}>{title}</div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 12, alignItems: "flex-end" }}>{children}</div>
+    </div>
+  );
+}
+
+function DecisionForm({ roundNumber, value, onChange, actuals, techs }) {
+  const set = (path, v) => {
+    const next = { ...value };
+    const [a, b, c] = path;
+    if (c !== undefined) next[a] = { ...next[a], [b]: { ...(next[a]?.[b] || {}), [c]: v } };
+    else if (b !== undefined) next[a] = { ...next[a], [b]: v };
+    else next[a] = v;
+    onChange(next);
+  };
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      {MARKET_REGIONS.map(({ key: region, currency }) => (
+        <Panel key={region} style={{ padding: 16 }}>
+          <Eyebrow info={`Precio, características y enfoque de marketing decididos para ${region}. El precio va en ${currency}.`}>{region}</Eyebrow>
+          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+            {techs.map((tec) => {
+              const cell = value.markets?.[mk(region, tec)] || {};
+              const real = actuals?.markets?.[mk(region, tec)];
+              return (
+                <div key={tec} style={{ display: "flex", flexWrap: "wrap", gap: 12, alignItems: "flex-start", paddingBottom: 10, borderBottom: `1px solid ${T.borderSoft}` }}>
+                  <div style={{ width: 58, fontSize: 12, fontWeight: 700, color: T.textDim, paddingTop: 22 }}>{tec}</div>
+                  <div><NumField label={`Precio (${currency})`} value={cell.price} onChange={(v) => set(["markets", mk(region, tec), "price"], v)} width={110} /><RealHint value={real?.price} /></div>
+                  <div><NumField label="Características" value={cell.features} onChange={(v) => set(["markets", mk(region, tec), "features"], v)} width={100} /><RealHint value={real?.features} /></div>
+                  <div><SelectField label="Enfoque de marketing" value={cell.focus} onChange={(v) => set(["markets", mk(region, tec), "focus"], v)} options={MARKETING_FOCUS_OPTIONS} /><RealHint value={real?.focus} /></div>
+                </div>
+              );
+            })}
+            <div><NumField label="Promoción en el mercado (miles USD)" value={value.promo?.[region]} onChange={(v) => set(["promo", region], v)} width={190} /><RealHint value={actuals?.promo?.[region]} /></div>
+          </div>
+        </Panel>
+      ))}
+
+      <Panel style={{ padding: 16 }}>
+        <Eyebrow info="Fábricas que se deciden construir o cerrar en esta ronda, por región.">Inversiones en fábricas</Eyebrow>
+        {FACTORY_REGIONS.map((region) => (
+          <FieldGroup key={region} title={region}>
+            <NumField label="Fábricas nuevas" value={value.factories?.[region]?.built} onChange={(v) => set(["factories", region, "built"], v)} width={120} />
+            <NumField label="Fábricas cerradas" value={value.factories?.[region]?.closed} onChange={(v) => set(["factories", region, "closed"], v)} width={120} />
+          </FieldGroup>
+        ))}
+      </Panel>
+
+      <Panel style={{ padding: 16 }}>
+        <Eyebrow info="Gasto en I+D, licencias y movimientos del equipo de I+D.">I+D y personal</Eyebrow>
+        <FieldGroup title="Inversión">
+          <NumField label="Gasto en I+D (miles USD)" value={value.rd?.spend} onChange={(v) => set(["rd", "spend"], v)} width={170} />
+          <NumField label="Licencias de I+D (miles USD)" value={value.rd?.licenses} onChange={(v) => set(["rd", "licenses"], v)} width={190} />
+        </FieldGroup>
+        <FieldGroup title="Personal de I+D">
+          <NumField label="Contrataciones" value={value.rd?.hires} onChange={(v) => set(["rd", "hires"], v)} width={120} />
+          <NumField label="Despidos" value={value.rd?.fires} onChange={(v) => set(["rd", "fires"], v)} width={120} />
+        </FieldGroup>
+        <RealHint value={actuals?.rdSpend} fmt={(v) => `${fmtDec(v, 0)} miles USD de I+D en el resultado`} />
+      </Panel>
+
+      <Panel style={{ padding: 16 }}>
+        <Eyebrow info="Decisiones financieras de la ronda: qué se reparte, qué se emite y qué deuda se toma o devuelve.">Finanzas</Eyebrow>
+        <FieldGroup title="Accionistas">
+          <NumField label="Dividendos (miles USD)" value={value.finance?.dividends} onChange={(v) => set(["finance", "dividends"], v)} width={170} />
+          <NumField label="Recompra de acciones" value={value.finance?.buyback} onChange={(v) => set(["finance", "buyback"], v)} width={170} />
+          <NumField label="Emisión de acciones" value={value.finance?.issue} onChange={(v) => set(["finance", "issue"], v)} width={170} />
+        </FieldGroup>
+        <FieldGroup title="Deuda">
+          <NumField label="Préstamos solicitados" value={value.finance?.loansTaken} onChange={(v) => set(["finance", "loansTaken"], v)} width={170} />
+          <NumField label="Préstamos devueltos" value={value.finance?.loansRepaid} onChange={(v) => set(["finance", "loansRepaid"], v)} width={170} />
+        </FieldGroup>
+      </Panel>
+
+      <Panel style={{ padding: 16 }}>
+        <Eyebrow info="El porqué de las decisiones de esta ronda. Es lo que más sirve al revisar los resultados después.">Notas del equipo</Eyebrow>
+        <textarea value={value.notes || ""} onChange={(e) => set(["notes"], e.target.value)}
+          placeholder={`¿Por qué decidimos esto para la ronda ${roundNumber}?`}
+          style={{ width: "100%", minHeight: 90, background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 7, color: T.text, padding: 10, fontSize: 13, fontFamily: "'Inter', sans-serif", resize: "vertical", outline: "none" }} />
+      </Panel>
+    </div>
+  );
+}
+
+// Resumen corto de una ronda para la línea de tiempo.
+function summarizeDecisions(d, techs) {
+  if (!d) return [];
+  const out = [];
+  MARKET_REGIONS.forEach(({ key: region, currency }) => {
+    const prices = techs.map((tec) => { const p = d.markets?.[mk(region, tec)]?.price; return p ? `${tec.replace("Tec ", "T")} ${fmtDec(p, 0)}` : null; }).filter(Boolean);
+    if (prices.length) out.push({ label: `${region} (${currency})`, text: prices.join(" · ") });
+    if (d.promo?.[region]) out.push({ label: `Promoción ${region}`, text: `${fmtDec(d.promo[region], 0)} miles USD` });
+  });
+  FACTORY_REGIONS.forEach((region) => {
+    const f = d.factories?.[region] || {};
+    const parts = [f.built ? `+${f.built} nuevas` : null, f.closed ? `-${f.closed} cerradas` : null].filter(Boolean);
+    if (parts.length) out.push({ label: `Fábricas ${region}`, text: parts.join(" · ") });
+  });
+  const rd = [d.rd?.spend ? `I+D ${fmtDec(d.rd.spend, 0)}` : null, d.rd?.licenses ? `licencias ${fmtDec(d.rd.licenses, 0)}` : null,
+    d.rd?.hires ? `+${d.rd.hires} personas` : null, d.rd?.fires ? `-${d.rd.fires} personas` : null].filter(Boolean);
+  if (rd.length) out.push({ label: "I+D", text: rd.join(" · ") });
+  const fin = [d.finance?.dividends ? `dividendos ${fmtDec(d.finance.dividends, 0)}` : null, d.finance?.buyback ? `recompra ${fmtDec(d.finance.buyback, 0)}` : null,
+    d.finance?.issue ? `emisión ${fmtDec(d.finance.issue, 0)}` : null, d.finance?.loansTaken ? `préstamos +${fmtDec(d.finance.loansTaken, 0)}` : null,
+    d.finance?.loansRepaid ? `devueltos ${fmtDec(d.finance.loansRepaid, 0)}` : null].filter(Boolean);
+  if (fin.length) out.push({ label: "Finanzas", text: fin.join(" · ") });
+  return out;
+}
+
+function DecisionTimeline({ byRound, techs, playedRounds }) {
+  const numbers = Object.keys(byRound).map(Number).sort((a, b) => a - b);
+  if (!numbers.length) return null;
+  return (
+    <Panel style={{ padding: 18 }}>
+      <Eyebrow info="Las decisiones cargadas, ronda a ronda. Sirve para ver cómo fue cambiando la estrategia.">Línea de tiempo de decisiones</Eyebrow>
+      <div style={{ display: "flex", flexDirection: "column" }}>
+        {numbers.map((n, i) => {
+          const items = summarizeDecisions(byRound[n], techs);
+          const played = playedRounds.includes(n);
+          return (
+            <div key={n} style={{ display: "flex", gap: 14 }}>
+              <div style={{ display: "flex", flexDirection: "column", alignItems: "center", flexShrink: 0 }}>
+                <div style={{ width: 11, height: 11, borderRadius: "50%", marginTop: 5, background: played ? T.amber : T.panel, border: `2px solid ${T.amber}` }} />
+                {i < numbers.length - 1 && <div style={{ flex: 1, width: 2, background: T.borderSoft, minHeight: 20 }} />}
+              </div>
+              <div style={{ paddingBottom: 18, minWidth: 0, flex: 1 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                  <span style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 700, fontSize: 14, color: T.text }}>Ronda {n}</span>
+                  <span style={{ fontSize: 10.5, padding: "2px 8px", borderRadius: 20, fontWeight: 600, background: played ? T.amberDim : T.panelAlt, color: played ? T.amber : T.textFaint, border: `1px solid ${played ? T.amber + "55" : T.border}` }}>
+                    {played ? "con resultados" : "sin resultados todavía"}
+                  </span>
+                </div>
+                {items.length > 0 && (
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: "4px 16px", marginTop: 6 }}>
+                    {items.map((it, k) => (
+                      <div key={k} style={{ fontSize: 12, color: T.textDim }}><span style={{ color: T.textFaint }}>{it.label}:</span> {it.text}</div>
+                    ))}
+                  </div>
+                )}
+                {byRound[n].notes && <div style={{ fontSize: 12.5, color: T.text, marginTop: 8, padding: "8px 11px", background: T.panelAlt, borderRadius: 7, border: `1px solid ${T.borderSoft}`, whiteSpace: "pre-wrap" }}>{byRound[n].notes}</div>}
+                {items.length === 0 && !byRound[n].notes && <div style={{ fontSize: 12, color: T.textFaint, marginTop: 4 }}>Sin decisiones cargadas.</div>}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </Panel>
+  );
+}
+
+function DecisionRegistrySection({ rounds, dataById, ourTeam }) {
+  const cesimRounds = sortedCesimRounds(rounds, dataById);
+  const playedNumbers = cesimRounds.map((r) => r.roundNumber).filter(Number.isFinite);
+  const latestData = cesimRounds.length ? dataById[cesimRounds[cesimRounds.length - 1].id] : null;
+  const techs = latestData ? techsInRound(latestData) : TECH_LABELS;
+
+  const [byRound, setByRound] = useState({});
+  const [extra, setExtra] = useState([]);
+  const [selected, setSelected] = useState(null);
+  const [draft, setDraft] = useState(null);
+  const [dirty, setDirty] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+
+  // La próxima ronda siempre está disponible aunque todavía no existan sus resultados.
+  const nextNumber = (playedNumbers.length ? Math.max(...playedNumbers) : 0) + 1;
+  const roundNumbers = useMemo(() => {
+    const set = new Set([...playedNumbers, ...Object.keys(byRound).map(Number), ...extra, nextNumber]);
+    return [...set].filter((n) => Number.isFinite(n) && n > 0).sort((a, b) => a - b);
+  }, [playedNumbers.join(","), Object.keys(byRound).join(","), extra.join(","), nextNumber]);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const nums = await listDecisionRounds();
+      const entries = await Promise.all(nums.map(async (n) => [n, await loadDecisions(n)]));
+      if (!alive) return;
+      const map = {};
+      entries.forEach(([n, d]) => { if (d) map[n] = d; });
+      setByRound(map);
+      setLoading(false);
+    })();
+    return () => { alive = false; };
+  }, []);
+
+  // Arranca en la ronda que todavía no tiene resultados: es la que hay que decidir.
+  useEffect(() => { if (selected === null && !loading) setSelected(nextNumber); }, [loading, nextNumber, selected]);
+  useEffect(() => {
+    if (selected === null) return;
+    setDraft(byRound[selected] ? { ...emptyDecisions(selected), ...byRound[selected] } : emptyDecisions(selected));
+    setDirty(false);
+  }, [selected, loading]);
+
+  const save = async () => {
+    setSaving(true);
+    await saveDecisionsFor(selected, draft);
+    setByRound((prev) => ({ ...prev, [selected]: draft }));
+    setDirty(false); setSaving(false);
+  };
+  const copyPrevious = () => {
+    const prevNums = roundNumbers.filter((n) => n < selected && byRound[n]);
+    const from = prevNums[prevNums.length - 1];
+    if (!from) return;
+    setDraft({ ...JSON.parse(JSON.stringify(byRound[from])), roundNumber: selected, notes: draft?.notes || "" });
+    setDirty(true);
+  };
+
+  if (loading) return <div style={{ padding: 20, color: T.textFaint, display: "flex", alignItems: "center", gap: 8 }}><Loader2 size={14} className="spin" /> Cargando decisiones…</div>;
+
+  const isPlayed = playedNumbers.includes(selected);
+  const selectedRound = cesimRounds.find((r) => r.roundNumber === selected);
+  const actuals = isPlayed && selectedRound ? actualsForRound(dataById[selectedRound.id], ourTeam) : null;
+  const canCopy = roundNumbers.some((n) => n < selected && byRound[n]);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+      <Panel style={{ padding: 16 }}>
+        <Eyebrow info="Las decisiones se cargan antes de conocer los resultados, así que la próxima ronda siempre está disponible acá aunque su archivo todavía no exista. Al subir ese .xls, lo cargado queda enganchado solo.">Ronda a registrar</Eyebrow>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+          {roundNumbers.map((n) => {
+            const played = playedNumbers.includes(n);
+            const has = !!byRound[n];
+            return (
+              <button key={n} onClick={() => setSelected(n)} title={played ? "Ronda con resultados cargados" : "Ronda sin resultados todavía"}
+                style={{ padding: "6px 12px", borderRadius: 7, fontSize: 12.5, cursor: "pointer", fontWeight: 600, display: "flex", alignItems: "center", gap: 6,
+                  border: `1px solid ${n === selected ? T.amber : T.border}`, background: n === selected ? T.amberDim : "transparent", color: n === selected ? T.amber : T.textDim }}>
+                R{n}
+                {has && <span style={{ width: 6, height: 6, borderRadius: "50%", background: T.green }} title="Tiene decisiones guardadas" />}
+                {!played && <span style={{ fontSize: 10, color: T.textFaint, fontWeight: 500 }}>próxima</span>}
+              </button>
+            );
+          })}
+          <button onClick={() => setExtra((e) => [...e, Math.max(...roundNumbers) + 1])} style={{ ...ghostBtn, padding: "5px 11px", fontSize: 11.5 }}>+ Agregar ronda</button>
+        </div>
+      </Panel>
+
+      {selected !== null && draft && (
+        <>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+            <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 16, fontWeight: 700, color: T.text }}>Decisiones de la ronda {selected}</div>
+            {isPlayed
+              ? <span style={{ fontSize: 11.5, color: T.textDim }}>Resultados cargados — debajo de cada campo se muestra lo que efectivamente pasó.</span>
+              : <span style={{ fontSize: 11.5, color: T.amber, fontWeight: 600 }}>Todavía sin resultados: es la ronda que están decidiendo.</span>}
+            {canCopy && <button onClick={copyPrevious} style={{ ...ghostBtn, padding: "5px 11px", fontSize: 11.5 }}>Copiar de la ronda anterior</button>}
+          </div>
+
+          <DecisionForm roundNumber={selected} value={draft} onChange={(v) => { setDraft(v); setDirty(true); }} actuals={actuals} techs={techs} />
+
+          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+            <button onClick={save} disabled={!dirty || saving} style={{ ...primaryBtn, opacity: !dirty || saving ? 0.5 : 1, cursor: !dirty || saving ? "default" : "pointer" }}>
+              {saving ? <Loader2 size={13} className="spin" /> : <CheckCircle2 size={13} />} {dirty ? "Guardar decisiones" : "Guardado"}
+            </button>
+            <span style={{ fontSize: 11.5, color: T.textFaint }}>Se comparte con todo el equipo.</span>
+          </div>
+        </>
+      )}
+
+      <DecisionTimeline byRound={byRound} techs={techs} playedRounds={playedNumbers} />
+    </div>
+  );
+}
+
 function TabSection({ title, children }) {
   return (
     <section style={{ marginBottom: 34 }}>
@@ -3941,7 +4289,8 @@ function RatiosTab({ rounds, dataById, ourTeam, regionFilter }) {
 function DecisionesTab({ rounds, dataById, ourTeam }) {
   return (
     <>
-      <TabSection title="Estrategia"><StrategySection rounds={rounds} dataById={dataById} ourTeam={ourTeam} /></TabSection>
+      <TabSection title="Registro de decisiones por ronda"><DecisionRegistrySection rounds={rounds} dataById={dataById} ourTeam={ourTeam} /></TabSection>
+      <TabSection title="Plan estratégico"><StrategySection rounds={rounds} dataById={dataById} ourTeam={ourTeam} /></TabSection>
       <TabSection title="Premisas"><PremisesSection /></TabSection>
     </>
   );
